@@ -1,0 +1,271 @@
+# 🚀 DevOps Lab — Real Incident Practice on AWS Kubernetes
+
+> Built a production-like Kubernetes environment on AWS from scratch, simulated real P1 incidents, and resolved them using the same tools and process used by DevOps engineers in real companies.
+
+---
+
+## 🧱 What I Built
+
+A fully functional DevOps practice lab on AWS consisting of:
+
+- An **EC2 instance** (Ubuntu 22.04) on AWS free tier acting as a cloud server
+- **Docker** installed and configured for container management
+- **k3s** (lightweight Kubernetes) running as a single-node cluster
+- A **production namespace** with a deployed login microservice
+- **Prometheus + Grafana** for real-time monitoring and alerting
+- A **GitHub Actions CI/CD pipeline** that triggers on every git push
+
+### Architecture
+
+```
+AWS EC2 (t2.micro — Ubuntu 22.04)
+│
+├── Docker (container runtime)
+│
+├── k3s (Kubernetes cluster)
+│   ├── namespace: production
+│   │   └── deployment: login-service (nginx:alpine)
+│   └── namespace: monitoring
+│       ├── Prometheus (metrics collection)
+│       └── Grafana (dashboards + alerting)
+│
+└── GitHub Actions (CI/CD pipeline)
+    └── triggers on push to main → build → deploy
+```
+
+---
+
+## 🔥 Incidents Simulated & Resolved
+
+### Incident 1 — P1: App Down, Users Cannot Login
+
+**Scenario:** login-service pods in `CrashLoopBackOff` / `CreateContainerConfigError`. All login requests returning 503.
+
+**Investigation:**
+```bash
+# Checked pod status
+kubectl get pods -n production
+
+# Found pods crashing — described to read Events
+kubectl describe pod login-service-9695cf7b9-c4lln -n production
+
+# Events showed:
+# Warning Failed — Error: secret "login-secrets-v2" not found
+```
+
+**Root Cause:** A new deployment referenced a Kubernetes secret `login-secrets-v2` that was never created in the production namespace. The app read an empty DB password, failed authentication, and crashed on every startup attempt.
+
+**Fix:**
+```bash
+# Created the missing secret
+kubectl create secret generic login-secrets-v2 \
+  --from-literal=db_pass='mysecretpassword' \
+  -n production
+
+# Restarted pods to pick up the secret
+kubectl rollout restart deployment/login-service -n production
+
+# Verified recovery
+kubectl get pods -n production -w
+```
+
+**Result:** Pods recovered from `CreateContainerConfigError` → `Running` within 60 seconds.
+
+**Prevention:** Add a pre-deploy check in CI/CD pipeline to verify all referenced secrets exist before deploying.
+
+---
+
+### Incident 2 — Bad Deployment (Wrong Image Tag)
+
+**Scenario:** Developer pushed a deployment with a non-existent Docker image tag. Pods went into `ImagePullBackOff`.
+
+**What I observed:**
+```bash
+kubectl get pods -n production -w
+
+# Output:
+# login-service-7dc5fd698c-9jmh8   0/1   ErrImagePull      0   13s
+# login-service-7dc5fd698c-9jmh8   0/1   ImagePullBackOff  0   17s
+# login-service-9695cf7b9-b7bfx    1/1   Running           0   90s  ← old pods kept serving
+```
+
+**Key learning:** Kubernetes rolling deployment kept old pods running while trying the new version — users were partially served, not fully down. This is why rolling deployments are the default strategy.
+
+**Fix — Rollback in under 30 seconds:**
+```bash
+# Checked deployment history
+kubectl rollout history deployment/login-service -n production
+
+# Rolled back to last good version
+kubectl rollout undo deployment/login-service -n production
+
+# Watched recovery
+kubectl rollout status deployment/login-service -n production
+```
+
+**Result:** Service fully restored within 90 seconds of rollback command.
+
+---
+
+### Incident 3 — Server Disk Full
+
+**Scenario:** Simulated disk filling up (common cause of DB write failures and app crashes in production).
+
+**Investigation:**
+```bash
+# Checked overall disk usage
+df -h
+
+# Found which directories were consuming most space
+du -sh /* 2>/dev/null | sort -rh | head -10
+
+# Located large files
+find / -size +100M -type f 2>/dev/null
+```
+
+**Fix:**
+```bash
+# Removed large dummy files
+rm -f /tmp/bigfile
+
+# Cleaned up unused Docker images and containers
+docker system prune -f
+
+# Cleared old system logs
+sudo journalctl --vacuum-time=2d
+```
+
+**Result:** Recovered disk space. Learned that `docker system prune` alone can free 20–50GB on busy CI servers.
+
+---
+
+## 🐛 Real Problems I Hit (and Fixed)
+
+These weren't simulated — these were actual issues I ran into during setup:
+
+### Problem 1 — k3s TLS Handshake Timeout
+**Error:** `Unable to connect to the server: net/http: TLS handshake timeout`
+
+**Root cause:** t2.micro only has 1GB RAM. k3s was consuming 492MB leaving only 74MB free — not enough for the API server to respond.
+
+**Fix:**
+```bash
+# Checked memory
+free -h
+# Confirmed: only 74Mi available, 0B swap
+
+# Added 2GB swap space
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+**Learning:** Always provision swap on small servers. Production Kubernetes nodes need minimum 2GB RAM — t2.micro is below the recommended threshold.
+
+---
+
+### Problem 2 — YAML Parsing Error (line 2)
+**Error:** `error parsing deployment.yaml: yaml: line 2: mapping values are not allowed in this context`
+
+**Root cause:** When copy-pasting a `cat > file << 'EOF'` heredoc command, the terminal included the `cat` command itself as the first line of the file. So line 1 was literally `cat > deployment.yaml << 'EOF'` and `apiVersion:` became line 2 — which the YAML parser couldn't handle.
+
+**Diagnosed with:**
+```bash
+cat -A deployment.yaml | head -5
+# Revealed: cat > deployment.yaml << 'EOF'$ as line 1
+```
+
+**Fix:**
+```bash
+# Removed the first bad line
+sed -i '1d' deployment.yaml
+
+# When file was still corrupted — rewrote using Python to bypass terminal issues
+python3 -c "
+content = '''apiVersion: apps/v1
+...
+'''
+open('deployment.yaml', 'w').write(content)
+"
+```
+
+**Learning:** `cat -A` shows hidden characters in files. Always verify file contents before applying YAML to Kubernetes.
+
+---
+
+### Problem 3 — Wrong Filename on kubectl apply
+**Error:** `error: the path "login-deployment.yaml" does not exist`
+
+**Root cause:** File was saved as `deployment.yaml` but command referenced `login-deployment.yaml`.
+
+**Fix:**
+```bash
+ls -ltr  # always check what files actually exist first
+kubectl apply -f deployment.yaml  # use the correct name
+```
+
+**Learning:** Simple but real — filename mismatches break pipelines in production too.
+
+---
+
+## 🛠 Tools & Commands Learned
+
+| Tool | Commands used |
+|------|--------------|
+| kubectl | `get pods`, `describe pod`, `apply`, `rollout undo`, `rollout history`, `rollout restart`, `create secret`, `exec`, `logs`, `get nodes` |
+| Docker | `run`, `system prune`, `system df` |
+| Linux | `free -h`, `df -h`, `du -sh`, `find`, `dd`, `fallocate`, `sed`, `cat -A`, `journalctl` |
+| k3s | install, systemctl management, kubeconfig setup |
+| Helm | `repo add`, `repo update`, `install` |
+| GitHub Actions | workflow YAML, push triggers, build steps |
+
+---
+
+## 📊 Monitoring Setup
+
+Installed the full `kube-prometheus-stack` via Helm:
+
+```bash
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --set grafana.adminPassword=devops123
+```
+
+Accessed Grafana at `http://localhost:3000` via port-forward and watched pod health graphs drop in real time when breaking the login-service, then recover after fixing it.
+
+---
+
+## 💡 Key Takeaways
+
+1. **Always rollback first, fix forward later** — at 3am with users down, restoring service beats being right about the fix.
+
+2. **Read the Events section** in `kubectl describe` — it tells you exactly why a pod failed, no guessing needed.
+
+3. **CrashLoopBackOff vs ImagePullBackOff** — two different root causes. CrashLoopBackOff means the container starts but crashes (app error, missing config). ImagePullBackOff means Kubernetes can't even pull the image (wrong tag, no registry access).
+
+4. **Swap space saves small servers** — when you can't upgrade hardware immediately, swap buys time.
+
+5. **`docker system prune` is your friend** — unused images pile up silently and fill disks.
+
+6. **Rolling deployments protect users** — Kubernetes keeps old pods alive while rolling out new ones. A bad new version won't take down all pods instantly.
+
+---
+
+## 🗺 What's Next
+
+- [ ] Terraform — create the entire AWS infra as code
+- [ ] AWS deeper — VPC, IAM roles, EKS, ALB
+- [ ] Multi-service deployment — connect frontend + backend + database
+- [ ] AlertManager — auto-notify Slack when pods crash
+- [ ] Full end-to-end project — deploy a real app through CI/CD to Kubernetes
+
+---
+
+## 👤 About
+
+Learning DevOps by doing — real incidents, real servers, real fixes.
+Mentored through scenario-based learning inspired by Abishek Veeramalla's approach.
+
+> "You don't learn DevOps by reading commands. You learn it by fixing things at 3am."
