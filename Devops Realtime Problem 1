@@ -214,7 +214,7 @@ kubectl apply -f deployment.yaml  # use the correct name
 
 | Tool | Commands used |
 |------|--------------|
-| kubectl | `get pods`, `describe pod`, `apply`, `rollout undo`, `rollout history`, `rollout restart`, `create secret`, `exec`, `logs`, `get nodes` |
+| kubectl | `get pods`, `describe pod`, `apply`, `rollout undo`, `rollout history`, `rollout restart`, `create secret`, `exec`, `logs`, `get nodes`, `top nodes`, `top pods` |
 | Docker | `run`, `system prune`, `system df` |
 | Linux | `free -h`, `df -h`, `du -sh`, `find`, `dd`, `fallocate`, `sed`, `cat -A`, `journalctl` |
 | k3s | install, systemctl management, kubeconfig setup |
@@ -269,3 +269,99 @@ Learning DevOps by doing — real incidents, real servers, real fixes.
 Mentored through scenario-based learning inspired by Abishek Veeramalla's approach.
 
 > "You don't learn DevOps by reading commands. You learn it by fixing things at 3am."
+
+---
+
+### Incident 4 — OOMKilled: Memory Leak Killing Pods
+
+**Scenario:** `memory-leak-app` pod restarting every 15 seconds overnight. On-call alert fires at 2:47 AM.
+
+```
+CRITICAL: memory-leak-app restarted 8 times in last hour
+Reason: OOMKilled
+Node memory usage: 94%
+```
+
+**Investigation:**
+```bash
+# Step 1 — confirmed OOMKilled with restart count
+kubectl get pods -n production -w
+# memory-leak-app-xxx   0/1   OOMKilled        1 (23s ago)
+# memory-leak-app-xxx   0/1   CrashLoopBackOff 1 (13s ago)
+# memory-leak-app-xxx   0/1   OOMKilled        2 (15s ago)
+
+# Step 2 — described pod, read Events section
+kubectl describe pod memory-leak-app-6585445c9d-m5n5w -n production
+# Events showed: x5 container restarts, BackOff restarting failed container
+
+# Step 3 — checked node and pod memory usage
+kubectl top nodes
+# ip-172-31-42-240   160m   8%   507Mi   55%
+
+kubectl top pods -n production
+# memory-leak-app did NOT appear — crashing too fast for metrics to scrape
+# (This itself is a diagnostic clue — severe leak)
+```
+
+**Root Cause:** Memory limit set to `100Mi` but the app (stress tool) was allocating `150Mi`. Linux kernel OOM killer terminated the container every time it exceeded the limit. Exit Code 137 = OOMKilled.
+
+```
+App needs:    150Mi
+Limit was:    100Mi  ← too low
+Kubernetes:   killed it every ~15 seconds
+```
+
+**Fix — Right-sized the memory limit:**
+```bash
+# Updated deployment with correct memory limits
+# limits.memory: 200Mi  (was 100Mi)
+# requests.memory: 100Mi
+
+kubectl apply -f memleak-fixed.yaml
+kubectl get pods -n production -w
+
+# Result:
+# memory-leak-app-7989d756d4-5qdpl   1/1   Running   0   38s  ✅
+```
+
+**Result:** Pod went from OOMKilled every 15 seconds → stable `Running` with `RESTARTS: 0`.
+
+**Decision framework used:**
+```
+Exit Code 137 confirmed → OOMKilled
+↓
+Is it a code bug (memory leak)?  → rollback to previous version
+Is the limit just too low?       → increase memory limit
+Is it a traffic spike?           → scale up replicas
+→ In this case: limit was too low → increased from 100Mi to 200Mi
+```
+
+**Prevention:**
+- Always set both `requests` and `limits` on every container
+- Set up Grafana alert when pod memory usage > 80% of limit
+- Use `kubectl top pods` regularly to baseline normal memory usage
+
+---
+
+---
+
+## 📊 Incident Summary Table
+
+| # | Incident | Root Cause | Fix | Downtime |
+|---|----------|-----------|-----|----------|
+| 1 | App down — users can't login | Missing Kubernetes secret `login-secrets-v2` | `kubectl create secret` + rollout restart | ~19 min |
+| 2 | Bad deployment — ImagePullBackOff | Wrong Docker image tag pushed to prod | `kubectl rollout undo` | ~90 sec |
+| 3 | Server disk full | Log files + Docker images piling up | `docker system prune` + log cleanup | ~5 min |
+| 4 | OOMKilled — pods restarting every 15s | Memory limit (100Mi) < app usage (150Mi) | Increased limit to 200Mi | ~3 min |
+
+---
+
+## 🧠 Additional Key Takeaways (from OOMKill incident)
+
+7. **Exit Code 137 = OOMKilled** — Linux kernel killed the container for exceeding memory limit. Always set both `requests` and `limits` on every container.
+
+8. **Missing from `kubectl top pods`** — if a pod doesn't show up in top output, it's crashing too fast for metrics to scrape. Sign of a severe issue.
+
+9. **`kubectl top nodes` first, `kubectl top pods` second** — always investigate top-down. Confirm node is stressed, then find which pod is the culprit.
+
+10. **`python3 -c` for writing YAML on servers** — heredoc (`cat << EOF`) can include the command itself as line 1 when copy-pasting in certain terminals. Python write bypasses this completely.
