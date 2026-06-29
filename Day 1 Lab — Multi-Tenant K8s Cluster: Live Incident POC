@@ -1,0 +1,314 @@
+# Day 1 Lab — Multi-Tenant K8s Cluster: Live Incident POC
+
+**Date:** 2026-06-29
+**Engineer:** Jeraled Giltus
+**Environment:** AWS EC2 Ubuntu — t2.micro
+**Lab Goal:** Design and fix a multi-tenant Kubernetes cluster with namespace isolation
+
+---
+
+## What I Was Trying to Do
+
+Set up a Kubernetes cluster on EC2 with two teams:
+- `team-falcon-staging` — Team Falcon's staging environment
+- `team-hawk-prod` — Team Hawk's production environment
+
+**Goal:** Prove that without NetworkPolicy, pods from one team can reach another team's pods (security breach), then fix it.
+
+---
+
+## Incident 1 — Wrong Package Manager (OS Mismatch)
+
+### What Happened
+The lab script used `yum` (Amazon Linux) but my EC2 runs Ubuntu, which uses `apt`.
+
+```bash
+# What failed
+sudo yum update -y && sudo yum install -y docker
+# Error: sudo: yum: command not found
+```
+
+### Root Cause
+Wrong OS assumed in the script. Ubuntu uses `apt`, not `yum`.
+
+### Fix Applied
+```bash
+# Correct commands for Ubuntu
+sudo apt update -y && sudo apt install -y docker.io
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker ubuntu
+newgrp docker
+```
+
+### What I Learned
+Always check your OS before running install commands:
+```bash
+cat /etc/os-release
+# Shows: Ubuntu or Amazon Linux
+```
+- Ubuntu/Debian → use `apt`
+- Amazon Linux/CentOS/RHEL → use `yum`
+
+---
+
+## Incident 2 — Kind CNI Failure on EC2
+
+### What Happened
+Kind (Kubernetes in Docker) failed to install the CNI network plugin on EC2.
+
+```
+ERROR: failed to create cluster: failed to apply overlay network
+Unable to connect to the server: context deadline exceeded
+X Installing CNI
+```
+
+### Root Cause
+Kind needs privileged network access to configure overlay networking inside Docker containers. EC2 instances restrict this by default — the container inside Docker couldn't configure its own network stack.
+
+### Fix Applied
+Switched from Kind to **k3s** — a lightweight Kubernetes distribution that works natively on EC2 without privileged networking requirements.
+
+```bash
+# Install k3s (works on EC2 out of the box)
+curl -sfL https://get.k3s.io | sh -
+
+# Configure kubectl
+mkdir -p ~/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+sudo chown ubuntu:ubuntu ~/.kube/config
+export KUBECONFIG=~/.kube/config
+echo "export KUBECONFIG=~/.kube/config" >> ~/.bashrc
+
+# Verify cluster running
+kubectl get nodes
+# Output: node Ready
+```
+
+### What I Learned
+| Tool | Best For | Works on EC2? |
+|---|---|---|
+| Kind | Local dev, CI pipelines | Sometimes — needs privileged networking |
+| k3s | Lightweight prod-like clusters | Yes — works perfectly |
+| minikube | Local dev only | No — needs VM or Docker driver |
+
+**k3s is the right choice for EC2-based Kubernetes labs.**
+
+---
+
+## Incident 3 — Real Production Pod Stuck: ContainerCreating
+
+### What Happened
+After setting up namespaces, `hawk-pod` stayed in `ContainerCreating` for over 4 minutes.
+
+```bash
+kubectl get pods -A
+# team-hawk-prod   hawk-pod   0/1   ContainerCreating   0   4m7s
+```
+
+### Diagnosis Steps
+```bash
+# Step 1: check pod events
+kubectl describe pod hawk-pod -n team-hawk-prod | tail -20
+# Showed: Successfully assigned to node but container not starting
+
+# Step 2: check all pods for patterns
+kubectl get pods -A
+# Found: 3 pods in production with ImagePullBackOff for 11 days
+# Found: metrics-server with 190 restarts
+# Found: traefik with 126 restarts
+```
+
+### Root Cause Found
+Two separate issues discovered:
+
+**Issue A — Wrong image tag deployed to production:**
+```
+Image: nginx:thisdoesnotexist
+Reason: ImagePullBackOff
+Back-off pulling image "nginx:thisdoesnotexist" (x935 over 5 days)
+```
+
+Someone deployed a pod with a non-existent Docker image tag. Kubernetes tried to pull it 935 times over 5 days and failed every time.
+
+**Issue B — Flannel CNI network plugin broken:**
+```
+Failed to create pod sandbox: plugin type="flannel" failed
+failed to load flannel 'subnet.env' file:
+open /run/flannel/subnet.env: no such file or directory
+```
+
+The CNI (Container Network Interface) — the network brain of Kubernetes — had a missing configuration file. This caused ALL new pods to get stuck in ContainerCreating.
+
+### Fix Applied
+
+**Fix A — Correct the wrong image tag:**
+```bash
+# Find the deployment
+kubectl get deployment -n production
+
+# Update to a real image tag
+kubectl set image deployment/price-service \
+  price-service=nginx:latest \
+  -n production
+
+# Verify rollout
+kubectl rollout status deployment/price-service -n production
+```
+
+**Fix B — Restart the Flannel CNI daemonset:**
+```bash
+# Check if subnet.env file exists
+ls -la /run/flannel/subnet.env
+# Result: file missing = confirmed root cause
+
+# Check flannel pod status
+kubectl get pods -n kube-system | grep flannel
+
+# Restart flannel to regenerate subnet config
+kubectl rollout restart daemonset \
+  -n kube-system \
+  $(kubectl get ds -n kube-system | grep flannel | awk '{print $1}')
+
+# Verify pods recover
+kubectl get pods -n team-hawk-prod -w
+```
+
+### What I Learned
+- **CNI = the network brain of Kubernetes.** Without it, no pod can get an IP address and no new containers can start.
+- **ImagePullBackOff** = Kubernetes can't download the container image. Always check: does the image tag actually exist?
+- **One broken component cascades.** Flannel being broken blocked ALL new pods, not just one.
+
+---
+
+## Incident 4 — Security Breach: Cross-Namespace Traffic (The Main Lab Goal)
+
+### The Security Problem
+Without any NetworkPolicy, pods in `team-falcon-staging` can freely communicate with pods in `team-hawk-prod`. In a real multi-tenant cluster, this means:
+- Team A can read Team B's data
+- A compromised pod in staging can attack production
+- Zero network isolation between customers
+
+### Reproducing the Breach
+```bash
+# Get hawk-pod's internal IP
+HAWK_IP=$(kubectl get pod hawk-pod \
+  -n team-hawk-prod \
+  -o jsonpath='{.status.podIP}')
+
+echo "Hawk pod IP: $HAWK_IP"
+
+# From falcon-pod, try to reach hawk-pod
+kubectl exec -n team-falcon-staging falcon-pod \
+  -- curl -s --max-time 5 $HAWK_IP
+
+# RESULT: nginx welcome page = cross-namespace traffic works = SECURITY BREACH
+```
+
+### Fix: Apply NetworkPolicy — Default Deny All
+
+```bash
+# Step 1: Block ALL traffic in team-falcon-staging
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: team-falcon-staging
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+EOF
+
+# Step 2: Block ALL traffic in team-hawk-prod
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: team-hawk-prod
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+EOF
+
+# Step 3: Verify isolation — this should now FAIL (timeout = good)
+kubectl exec -n team-falcon-staging falcon-pod \
+  -- curl -s --max-time 5 $HAWK_IP
+
+# RESULT: connection timeout = isolation working = FIXED
+```
+
+### What I Learned
+- **Kubernetes allows ALL traffic between pods by default.** There is no built-in isolation.
+- **NetworkPolicy = firewall rules for pods.** You define what is allowed; everything else is blocked.
+- **Default deny is the right starting point.** Block everything first, then explicitly open only what's needed.
+- **`podSelector: {}`** means "apply to ALL pods in this namespace."
+
+---
+
+## Key Concepts Learned Today
+
+| Concept | Simple English Explanation |
+|---|---|
+| Namespace | A folder inside Kubernetes — keeps teams/environments separated |
+| NetworkPolicy | Firewall rules for pods — controls who can talk to who |
+| CNI | The network brain — gives every pod an IP address |
+| ImagePullBackOff | Kubernetes can't download the container image |
+| ContainerCreating | Pod is scheduled but container hasn't started yet |
+| k3s | Lightweight Kubernetes — perfect for EC2 labs |
+| Default deny | Block all traffic first, then allow only what's needed |
+
+---
+
+## Commands Reference Card
+
+```bash
+# Cluster health
+kubectl get nodes
+kubectl get pods -A
+kubectl get events -A --sort-by='.lastTimestamp' | tail -20
+
+# Namespace management
+kubectl get namespaces
+kubectl create namespace my-namespace
+
+# Pod debugging
+kubectl describe pod <pod-name> -n <namespace>
+kubectl logs <pod-name> -n <namespace>
+kubectl logs <pod-name> -n <namespace> --previous
+
+# NetworkPolicy
+kubectl get networkpolicy -A
+kubectl describe networkpolicy -n <namespace>
+
+# Fix wrong image
+kubectl set image deployment/<name> <container>=<image>:<tag> -n <namespace>
+
+# Fix CNI
+kubectl rollout restart daemonset -n kube-system <flannel-daemonset-name>
+```
+
+---
+
+## Interview Answer Seed
+
+> *"During hands-on lab practice, I set up a multi-tenant Kubernetes cluster on EC2 and discovered that without NetworkPolicy, pods from different teams could freely communicate — a critical security breach in a real environment. I applied default-deny NetworkPolicies to both namespaces to enforce isolation. I also diagnosed two production incidents live: an ImagePullBackOff caused by a non-existent image tag that had been failing 935 times over 5 days, and a broken Flannel CNI that was blocking all new pod creation. I fixed both using kubectl set image for the deployment and restarting the Flannel daemonset to regenerate the missing subnet.env file."*
+
+---
+
+## Next Steps — Day 2
+
+- [ ] Complete Lab 1: verify NetworkPolicy isolation with curl test
+- [ ] Start Lab 2: Kustomize overlay drift
+- [ ] Learn: what is a deployment vs a pod vs a replicaset?
+- [ ] Commit Day 2 lab notes to this repo
+
+---
+
+*Part of 30-day Performance & Resilience Engineering interview prep journey*
+*Target role: Performance Engineer — Salesforce*
